@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/fs"
 	"math/rand"
 	"net/url"
 	"os"
@@ -62,8 +61,10 @@ const (
 	TERRAFORM_REMOTE_STATE_S3_REGION                                         = "us-west-2"
 	TERRAFORM_REMOTE_STATE_GCP_REGION                                        = "eu"
 	TEST_FIXTURE_PATH                                                        = "fixture/"
+	TEST_FIXTURE_INIT_ONCE                                                   = "fixture-init-once"
+	TEST_FIXTURE_PROVIDER_CACHE_MULTIPLE_PLATFORMS                           = "fixture-provider-cache/multiple-platforms"
 	TEST_FIXTURE_PROVIDER_CACHE_DIRECT                                       = "fixture-provider-cache/direct"
-	TEST_FIXTURE_PROVIDER_CACHE_FILESYSTEM_MIRROR                            = "fixture-provider-cache/filesystem-mirror"
+	TEST_FIXTURE_PROVIDER_CACHE_MIRROR                                       = "fixture-provider-cache/mirror"
 	TEST_FIXTURE_DESTROY_ORDER                                               = "fixture-destroy-order"
 	TEST_FIXTURE_CODEGEN_PATH                                                = "fixture-codegen"
 	TEST_FIXTURE_GCS_PATH                                                    = "fixture-gcs/"
@@ -193,11 +194,15 @@ const (
 	TEST_FIXTURE_GCS_PARALLEL_STATE_INIT                                     = "fixture-gcs-parallel-state-init"
 	TEST_FIXTURE_ASSUME_ROLE                                                 = "fixture-assume-role/external-id"
 	TEST_FIXTURE_ASSUME_ROLE_DURATION                                        = "fixture-assume-role/duration"
+	TEST_FIXTURE_ASSUME_ROLE_WEB_IDENTITY_ENV                                = "fixture-assume-role-web-identity/env-var"
+	TEST_FIXTURE_ASSUME_ROLE_WEB_IDENTITY_FILE                               = "fixture-assume-role-web-identity/file-path"
 	TEST_FIXTURE_GRAPH                                                       = "fixture-graph"
 	TEST_FIXTURE_SKIP_DEPENDENCIES                                           = "fixture-skip-dependencies"
 	TEST_FIXTURE_INFO_ERROR                                                  = "fixture-terragrunt-info-error"
 	TEST_FIXTURE_DEPENDENCY_OUTPUT                                           = "fixture-dependency-output"
 	TEST_FIXTURE_OUT_DIR                                                     = "fixture-out-dir"
+	TEST_FIXTURE_SOPS_ERRORS                                                 = "fixture-sops-errors"
+	TEST_FIXTURE_AUTH_PROVIDER_CMD                                           = "fixture-auth-provider-cmd"
 	TERRAFORM_BINARY                                                         = "terraform"
 	TOFU_BINARY                                                              = "tofu"
 	TERRAFORM_FOLDER                                                         = ".terraform"
@@ -209,29 +214,29 @@ const (
 	fixtureDownload = "fixture-download"
 )
 
-func TestTerragruntProviderCache(t *testing.T) {
-	t.Parallel()
-
-	cleanupTerraformFolder(t, TEST_FIXTURE_PROVIDER_CACHE_DIRECT)
-	tmpEnvPath := copyEnvironment(t, TEST_FIXTURE_PROVIDER_CACHE_DIRECT)
-	rootPath := util.JoinPath(tmpEnvPath, TEST_FIXTURE_PROVIDER_CACHE_DIRECT)
+func TestTerragruntProviderCacheMultiplePlatforms(t *testing.T) {
+	cleanupTerraformFolder(t, TEST_FIXTURE_PROVIDER_CACHE_MULTIPLE_PLATFORMS)
+	tmpEnvPath := copyEnvironment(t, TEST_FIXTURE_PROVIDER_CACHE_MULTIPLE_PLATFORMS)
+	rootPath := util.JoinPath(tmpEnvPath, TEST_FIXTURE_PROVIDER_CACHE_MULTIPLE_PLATFORMS)
 
 	cacheDir, err := util.GetCacheDir()
 	require.NoError(t, err)
-	providerCacheDir := filepath.Join(cacheDir, "provider-cache-test-direct")
+	providerCacheDir := filepath.Join(cacheDir, "provider-cache-multiple-platforms")
 
-	runTerragrunt(t, fmt.Sprintf("terragrunt run-all init --terragrunt-provider-cache --terragrunt-provider-cache-dir %s --terragrunt-log-level trace --terragrunt-non-interactive --terragrunt-working-dir %s", providerCacheDir, rootPath))
+	var (
+		platforms     = []string{"linux_amd64", "darwin_arm64"}
+		platformsArgs []string
+	)
 
-	providers := map[string][]string{
-		"first": []string{
-			"hashicorp/aws/5.36.0",
-			"hashicorp/azurerm/3.95.0",
-		},
-		"second": []string{
-			"hashicorp/aws/5.40.0",
-			"hashicorp/azurerm/3.95.0",
-			"hashicorp/kubernetes/2.27.0",
-		},
+	for _, platform := range platforms {
+		platformsArgs = append(platformsArgs, fmt.Sprintf("-platform=%s", platform))
+	}
+
+	runTerragrunt(t, fmt.Sprintf("terragrunt run-all providers lock %s  --terragrunt-no-auto-init --terragrunt-provider-cache --terragrunt-provider-cache-dir %s --terragrunt-log-level trace --terragrunt-non-interactive --terragrunt-working-dir %s", strings.Join(platformsArgs, " "), providerCacheDir, rootPath))
+
+	providers := []string{
+		"hashicorp/aws/5.36.0",
+		"hashicorp/azurerm/3.95.0",
 	}
 
 	registryName := "registry.opentofu.org"
@@ -239,65 +244,55 @@ func TestTerragruntProviderCache(t *testing.T) {
 		registryName = "registry.terraform.io"
 	}
 
-	for subDir, providers := range providers {
-		var (
-			actualApps   int
-			expectedApps = 10
-		)
+	for _, appName := range []string{"app1", "app2", "app3"} {
+		appPath := filepath.Join(rootPath, appName)
+		assert.True(t, util.FileExists(appPath))
 
-		subDir = filepath.Join(rootPath, subDir)
-
-		entries, err := os.ReadDir(subDir)
+		lockfilePath := filepath.Join(appPath, ".terraform.lock.hcl")
+		lockfileContent, err := os.ReadFile(lockfilePath)
 		require.NoError(t, err)
 
-		for _, entry := range entries {
-			if !entry.IsDir() {
-				continue
-			}
-			actualApps++
+		lockfile, diags := hclwrite.ParseConfig(lockfileContent, lockfilePath, hcl.Pos{Line: 1, Column: 1})
+		require.False(t, diags.HasErrors())
+		require.NotNil(t, lockfile)
 
-			appPath := filepath.Join(subDir, entry.Name())
+		for _, provider := range providers {
+			provider := path.Join(registryName, provider)
 
-			lockfilePath := filepath.Join(appPath, ".terraform.lock.hcl")
-			lockfileContent, err := os.ReadFile(lockfilePath)
-			require.NoError(t, err)
+			providerBlock := lockfile.Body().FirstMatchingBlock("provider", []string{filepath.Dir(provider)})
+			assert.NotNil(t, providerBlock)
 
-			lockfile, diags := hclwrite.ParseConfig(lockfileContent, lockfilePath, hcl.Pos{Line: 1, Column: 1})
-			require.False(t, diags.HasErrors())
+			providerPath := filepath.Join(providerCacheDir, provider)
+			assert.True(t, util.FileExists(providerPath))
 
-			for _, provider := range providers {
-				var (
-					actualProviderSymlinks   int
-					expectedProviderSymlinks = 1
-					provider                 = path.Join(registryName, provider)
-				)
-
-				providerBlock := lockfile.Body().FirstMatchingBlock("provider", []string{filepath.Dir(provider)})
-				assert.NotNil(t, providerBlock)
-
-				providerPath := filepath.Join(appPath, ".terraform/providers", provider)
-				assert.True(t, util.FileExists(providerPath))
-
-				entries, err := os.ReadDir(providerPath)
-				assert.NoError(t, err)
-
-				for _, entry := range entries {
-					actualProviderSymlinks++
-					assert.Equal(t, fs.ModeSymlink, entry.Type())
-
-					symlinkPath := filepath.Join(providerPath, entry.Name())
-
-					actualPath, err := os.Readlink(symlinkPath)
-					assert.NoError(t, err)
-
-					expectedPath := filepath.Join(providerCacheDir, provider, entry.Name())
-					assert.Contains(t, actualPath, expectedPath)
-				}
-				assert.Equal(t, expectedProviderSymlinks, actualProviderSymlinks)
+			for _, platform := range platforms {
+				platformPath := filepath.Join(providerPath, platform)
+				assert.True(t, util.FileExists(platformPath))
 			}
 		}
-		assert.Equal(t, expectedApps, actualApps)
 	}
+}
+
+func TestTerragruntInitOnce(t *testing.T) {
+	t.Parallel()
+
+	tmpEnvPath := copyEnvironment(t, TEST_FIXTURE_INIT_ONCE)
+	rootPath := util.JoinPath(tmpEnvPath, TEST_FIXTURE_INIT_ONCE)
+
+	stdout, _, err := runTerragruntCommandWithOutput(t, fmt.Sprintf("terragrunt plan --terragrunt-non-interactive --terragrunt-working-dir %s", rootPath))
+	require.NoError(t, err)
+	assert.Contains(t, stdout, "Initializing modules")
+
+	// update the config creation time without changing content
+	cfgPath := filepath.Join(rootPath, "terragrunt.hcl")
+	bytes, err := os.ReadFile(cfgPath)
+	require.NoError(t, err)
+	err = os.WriteFile(cfgPath, bytes, 0644)
+	require.NoError(t, err)
+
+	stdout, _, err = runTerragruntCommandWithOutput(t, fmt.Sprintf("terragrunt plan --terragrunt-non-interactive --terragrunt-working-dir %s", rootPath))
+	require.NoError(t, err)
+	assert.NotContains(t, stdout, "Initializing modules", "init command executed more than once")
 }
 
 func TestTerragruntDestroyOrder(t *testing.T) {
@@ -4147,6 +4142,28 @@ func TestReadTerragruntConfigIamRole(t *testing.T) {
 	assert.True(t, util.FileNotExists(util.JoinPath(TEST_FIXTURE_READ_IAM_ROLE, identityArn+".txt")))
 }
 
+func TestReadTerragruntAuthProviderCmd(t *testing.T) {
+	t.Parallel()
+
+	cleanupTerraformFolder(t, TEST_FIXTURE_AUTH_PROVIDER_CMD)
+	tmpEnvPath := copyEnvironment(t, TEST_FIXTURE_AUTH_PROVIDER_CMD)
+	rootPath := util.JoinPath(tmpEnvPath, TEST_FIXTURE_AUTH_PROVIDER_CMD, "multiple-apps")
+	appPath := util.JoinPath(rootPath, "app1")
+	mockAuthCmd := filepath.Join(tmpEnvPath, TEST_FIXTURE_AUTH_PROVIDER_CMD, "mock-auth-cmd.sh")
+
+	runTerragrunt(t, fmt.Sprintf(`terragrunt run-all apply -auto-approve --terragrunt-non-interactive --terragrunt-working-dir %s --terragrunt-auth-provider-cmd %s`, rootPath, mockAuthCmd))
+
+	stdout, _, err := runTerragruntCommandWithOutput(t, fmt.Sprintf("terragrunt output -json --terragrunt-working-dir %s --terragrunt-auth-provider-cmd %s", appPath, mockAuthCmd))
+	assert.NoError(t, err)
+
+	outputs := map[string]TerraformOutput{}
+	require.NoError(t, json.Unmarshal([]byte(stdout), &outputs))
+
+	assert.Equal(t, outputs["foo-app1"].Value, "app1-bar")
+	assert.Equal(t, outputs["foo-app2"].Value, "app2-bar")
+	assert.Equal(t, outputs["foo-app3"].Value, "app3-bar")
+}
+
 func TestIamRolesLoadingFromDifferentModules(t *testing.T) {
 	t.Parallel()
 
@@ -4381,7 +4398,7 @@ func createTmpTerragruntGCSConfig(t *testing.T, templatesPath string, project st
 }
 
 func copyTerragruntConfigAndFillPlaceholders(t *testing.T, configSrcPath string, configDestPath string, s3BucketName string, lockTableName string, region string) {
-	copyTerragruntConfigAndFillMapPlaceholders(t, configSrcPath, configDestPath, map[string]string{
+	copyAndFillMapPlaceholders(t, configSrcPath, configDestPath, map[string]string{
 		"__FILL_IN_BUCKET_NAME__":      s3BucketName,
 		"__FILL_IN_LOCK_TABLE_NAME__":  lockTableName,
 		"__FILL_IN_REGION__":           region,
@@ -4389,25 +4406,25 @@ func copyTerragruntConfigAndFillPlaceholders(t *testing.T, configSrcPath string,
 	})
 }
 
-func copyTerragruntConfigAndFillMapPlaceholders(t *testing.T, configSrcPath string, configDestPath string, placeholders map[string]string) {
-	contents, err := util.ReadFileAsString(configSrcPath)
+func copyAndFillMapPlaceholders(t *testing.T, srcPath string, destPath string, placeholders map[string]string) {
+	contents, err := util.ReadFileAsString(srcPath)
 	if err != nil {
-		t.Fatalf("Error reading Terragrunt config at %s: %v", configSrcPath, err)
+		t.Fatalf("Error reading file at %s: %v", srcPath, err)
 	}
 
 	// iterate over placeholders and replace placeholders
 	for k, v := range placeholders {
 		contents = strings.ReplaceAll(contents, k, v)
 	}
-	if err := os.WriteFile(configDestPath, []byte(contents), 0444); err != nil {
-		t.Fatalf("Error writing temp Terragrunt config to %s: %v", configDestPath, err)
+	if err := os.WriteFile(destPath, []byte(contents), 0444); err != nil {
+		t.Fatalf("Error writing temp file to %s: %v", destPath, err)
 	}
 }
 
 func copyTerragruntGCSConfigAndFillPlaceholders(t *testing.T, configSrcPath string, configDestPath string, project string, location string, gcsBucketName string) {
 	email := os.Getenv("GOOGLE_IDENTITY_EMAIL")
 
-	copyTerragruntConfigAndFillMapPlaceholders(t, configSrcPath, configDestPath, map[string]string{
+	copyAndFillMapPlaceholders(t, configSrcPath, configDestPath, map[string]string{
 		"__FILL_IN_PROJECT__":     project,
 		"__FILL_IN_LOCATION__":    location,
 		"__FILL_IN_BUCKET_NAME__": gcsBucketName,
@@ -4560,11 +4577,11 @@ func deleteS3BucketWithRetry(t *testing.T, awsRegion string, bucketName string) 
 }
 
 // Delete the specified S3 bucket to clean up after a test
-func deleteS3Bucket(t *testing.T, awsRegion string, bucketName string) {
-	require.NoError(t, deleteS3BucketE(t, awsRegion, bucketName))
+func deleteS3Bucket(t *testing.T, awsRegion string, bucketName string, opts ...options.TerragruntOptionsFunc) {
+	require.NoError(t, deleteS3BucketE(t, awsRegion, bucketName, opts...))
 }
-func deleteS3BucketE(t *testing.T, awsRegion string, bucketName string) error {
-	mockOptions, err := options.NewTerragruntOptionsForTest("integration_test")
+func deleteS3BucketE(t *testing.T, awsRegion string, bucketName string, opts ...options.TerragruntOptionsFunc) error {
+	mockOptions, err := options.NewTerragruntOptionsForTest("integration_test", opts...)
 	if err != nil {
 		t.Logf("Error creating mockOptions: %v", err)
 		return err
@@ -4947,7 +4964,7 @@ func TestTerragruntRunAllCommandPrompt(t *testing.T) {
 	assert.Error(t, err)
 }
 
-func TestTerragruntInitOnce(t *testing.T) {
+func TestTerragruntLocalRunOnce(t *testing.T) {
 	t.Parallel()
 
 	cleanupTerraformFolder(t, TEST_FIXTURE_LOCAL_RUN_ONCE)
@@ -6555,7 +6572,7 @@ func TestTerragruntSkipConfirmExternalDependencies(t *testing.T) {
 	oldStdout := os.Stderr
 	os.Stderr = w
 
-	err = runTerragruntCommand(t, fmt.Sprintf("trragrunt destroy --terragrunt-working-dir %s", testPath), &stdout, &stderr)
+	err = runTerragruntCommand(t, fmt.Sprintf("terragrunt destroy --terragrunt-working-dir %s", testPath), &stdout, &stderr)
 	os.Stderr = oldStdout
 	assert.NoError(t, w.Close())
 
@@ -6883,7 +6900,7 @@ func TestTerragruntAssumeRoleDuration(t *testing.T) {
 
 	assumeRole := os.Getenv("AWS_TEST_S3_ASSUME_ROLE")
 
-	copyTerragruntConfigAndFillMapPlaceholders(t, originalTerragruntConfigPath, tmpTerragruntConfigFile, map[string]string{
+	copyAndFillMapPlaceholders(t, originalTerragruntConfigPath, tmpTerragruntConfigFile, map[string]string{
 		"__FILL_IN_BUCKET_NAME__":      s3BucketName,
 		"__FILL_IN_REGION__":           TERRAFORM_REMOTE_STATE_S3_REGION,
 		"__FILL_IN_LOGS_BUCKET_NAME__": s3BucketName + "-tf-state-logs",
@@ -6909,6 +6926,76 @@ func TestTerragruntAssumeRoleDuration(t *testing.T) {
 	assert.NotContains(t, output, "Initializing the backend...")
 	assert.NotContains(t, output, "has been successfully initialized!")
 	assert.Contains(t, output, "no changes are needed.")
+}
+
+func TestTerragruntAssumeRoleWebIdentityEnv(t *testing.T) {
+	t.Parallel()
+
+	assumeRole := os.Getenv("AWS_TEST_S3_ASSUME_ROLE")
+	tokenEnvVar := os.Getenv("AWS_TEST_S3_IDENTITY_TOKEN_VAR")
+	if tokenEnvVar == "" {
+		t.Skip("Missing required env var AWS_TEST_S3_IDENTITY_TOKEN_VAR")
+		return
+	}
+
+	tmpEnvPath := copyEnvironment(t, TEST_FIXTURE_ASSUME_ROLE_WEB_IDENTITY_ENV)
+	cleanupTerraformFolder(t, tmpEnvPath)
+	testPath := util.JoinPath(tmpEnvPath, TEST_FIXTURE_ASSUME_ROLE_WEB_IDENTITY_ENV)
+
+	originalTerragruntConfigPath := util.JoinPath(TEST_FIXTURE_ASSUME_ROLE_WEB_IDENTITY_ENV, "terragrunt.hcl")
+	tmpTerragruntConfigFile := util.JoinPath(testPath, "terragrunt.hcl")
+	s3BucketName := fmt.Sprintf("terragrunt-test-bucket-%s", strings.ToLower(uniqueId()))
+
+	defer deleteS3Bucket(t, TERRAFORM_REMOTE_STATE_S3_REGION, s3BucketName, options.WithIAMRoleARN(assumeRole), options.WithIAMWebIdentityToken(os.Getenv(tokenEnvVar)))
+
+	copyAndFillMapPlaceholders(t, originalTerragruntConfigPath, tmpTerragruntConfigFile, map[string]string{
+		"__FILL_IN_BUCKET_NAME__":            s3BucketName,
+		"__FILL_IN_REGION__":                 TERRAFORM_REMOTE_STATE_S3_REGION,
+		"__FILL_IN_ASSUME_ROLE__":            assumeRole,
+		"__FILL_IN_IDENTITY_TOKEN_ENV_VAR__": tokenEnvVar,
+	})
+
+	stdout := bytes.Buffer{}
+	stderr := bytes.Buffer{}
+
+	err := runTerragruntCommand(t, fmt.Sprintf("terragrunt apply  -auto-approve --terragrunt-non-interactive --terragrunt-working-dir %s", testPath), &stdout, &stderr)
+	assert.NoError(t, err)
+
+	output := fmt.Sprintf("%s %s", stderr.String(), stdout.String())
+	assert.Contains(t, output, "Apply complete! Resources: 1 added, 0 changed, 0 destroyed.")
+}
+
+func TestTerragruntAssumeRoleWebIdentityFile(t *testing.T) {
+	t.Parallel()
+
+	tmpEnvPath := copyEnvironment(t, TEST_FIXTURE_ASSUME_ROLE_WEB_IDENTITY_FILE)
+	cleanupTerraformFolder(t, tmpEnvPath)
+	testPath := util.JoinPath(tmpEnvPath, TEST_FIXTURE_ASSUME_ROLE_WEB_IDENTITY_FILE)
+
+	originalTerragruntConfigPath := util.JoinPath(TEST_FIXTURE_ASSUME_ROLE_WEB_IDENTITY_FILE, "terragrunt.hcl")
+	tmpTerragruntConfigFile := util.JoinPath(testPath, "terragrunt.hcl")
+	s3BucketName := fmt.Sprintf("terragrunt-test-bucket-%s", strings.ToLower(uniqueId()))
+
+	assumeRole := os.Getenv("AWS_TEST_S3_ASSUME_ROLE")
+	tokenFilePath := os.Getenv("AWS_TEST_S3_IDENTITY_TOKEN_FILE_PATH")
+
+	defer deleteS3Bucket(t, TERRAFORM_REMOTE_STATE_S3_REGION, s3BucketName, options.WithIAMRoleARN(assumeRole), options.WithIAMWebIdentityToken(tokenFilePath))
+
+	copyAndFillMapPlaceholders(t, originalTerragruntConfigPath, tmpTerragruntConfigFile, map[string]string{
+		"__FILL_IN_BUCKET_NAME__":              s3BucketName,
+		"__FILL_IN_REGION__":                   TERRAFORM_REMOTE_STATE_S3_REGION,
+		"__FILL_IN_ASSUME_ROLE__":              assumeRole,
+		"__FILL_IN_IDENTITY_TOKEN_FILE_PATH__": tokenFilePath,
+	})
+
+	stdout := bytes.Buffer{}
+	stderr := bytes.Buffer{}
+
+	err := runTerragruntCommand(t, fmt.Sprintf("terragrunt apply  -auto-approve --terragrunt-non-interactive --terragrunt-working-dir %s", testPath), &stdout, &stderr)
+	assert.NoError(t, err)
+
+	output := fmt.Sprintf("%s %s", stderr.String(), stdout.String())
+	assert.Contains(t, output, "Apply complete! Resources: 1 added, 0 changed, 0 destroyed.")
 }
 
 func prepareGraphFixture(t *testing.T) string {
@@ -6954,7 +7041,7 @@ func TestStorePlanFilesRunAllPlanApply(t *testing.T) {
 	testPath := util.JoinPath(tmpEnvPath, TEST_FIXTURE_OUT_DIR)
 
 	// run plan with output directory
-	_, output, err := runTerragruntCommandWithOutput(t, fmt.Sprintf("terraform run-all plan --terragrunt-non-interactive --terragrunt-log-level debug --terragrunt-working-dir %s --terragrunt-out-dir %s", testPath, tmpDir))
+	_, output, err := runTerragruntCommandWithOutput(t, fmt.Sprintf("terragrunt run-all plan --terragrunt-non-interactive --terragrunt-log-level debug --terragrunt-working-dir %s --terragrunt-out-dir %s", testPath, tmpDir))
 	require.NoError(t, err)
 
 	assert.Contains(t, output, fmt.Sprintf("Using output file %s", tmpDir))
@@ -6967,7 +7054,7 @@ func TestStorePlanFilesRunAllPlanApply(t *testing.T) {
 		assert.Equal(t, "tfplan.tfplan", filepath.Base(file))
 	}
 
-	_, _, err = runTerragruntCommandWithOutput(t, fmt.Sprintf("terraform run-all apply --terragrunt-non-interactive --terragrunt-log-level debug --terragrunt-working-dir %s --terragrunt-out-dir %s", testPath, tmpDir))
+	_, _, err = runTerragruntCommandWithOutput(t, fmt.Sprintf("terragrunt run-all apply --terragrunt-non-interactive --terragrunt-log-level debug --terragrunt-working-dir %s --terragrunt-out-dir %s", testPath, tmpDir))
 	require.NoError(t, err)
 }
 
@@ -6980,10 +7067,10 @@ func TestStorePlanFilesRunAllDestroy(t *testing.T) {
 	testPath := util.JoinPath(tmpEnvPath, TEST_FIXTURE_OUT_DIR)
 
 	// plan and apply
-	_, _, err := runTerragruntCommandWithOutput(t, fmt.Sprintf("terraform run-all plan --terragrunt-non-interactive --terragrunt-log-level debug --terragrunt-working-dir %s --terragrunt-out-dir %s", testPath, tmpDir))
+	_, _, err := runTerragruntCommandWithOutput(t, fmt.Sprintf("terragrunt run-all plan --terragrunt-non-interactive --terragrunt-log-level debug --terragrunt-working-dir %s --terragrunt-out-dir %s", testPath, tmpDir))
 	require.NoError(t, err)
 
-	_, _, err = runTerragruntCommandWithOutput(t, fmt.Sprintf("terraform run-all apply --terragrunt-non-interactive --terragrunt-log-level debug --terragrunt-working-dir %s --terragrunt-out-dir %s", testPath, tmpDir))
+	_, _, err = runTerragruntCommandWithOutput(t, fmt.Sprintf("terragrunt run-all apply --terragrunt-non-interactive --terragrunt-log-level debug --terragrunt-working-dir %s --terragrunt-out-dir %s", testPath, tmpDir))
 	require.NoError(t, err)
 
 	// remove all tfstate files from temp directory to prepare destroy
@@ -6995,7 +7082,7 @@ func TestStorePlanFilesRunAllDestroy(t *testing.T) {
 	}
 
 	// prepare destroy plan
-	_, output, err := runTerragruntCommandWithOutput(t, fmt.Sprintf("terraform run-all plan -destroy --terragrunt-non-interactive --terragrunt-log-level debug --terragrunt-working-dir %s --terragrunt-out-dir %s", testPath, tmpDir))
+	_, output, err := runTerragruntCommandWithOutput(t, fmt.Sprintf("terragrunt run-all plan -destroy --terragrunt-non-interactive --terragrunt-log-level debug --terragrunt-working-dir %s --terragrunt-out-dir %s", testPath, tmpDir))
 	require.NoError(t, err)
 
 	assert.Contains(t, output, fmt.Sprintf("Using output file %s", tmpDir))
@@ -7007,7 +7094,7 @@ func TestStorePlanFilesRunAllDestroy(t *testing.T) {
 		assert.Equal(t, "tfplan.tfplan", filepath.Base(file))
 	}
 
-	_, _, err = runTerragruntCommandWithOutput(t, fmt.Sprintf("terraform run-all apply --terragrunt-non-interactive --terragrunt-log-level debug --terragrunt-working-dir %s --terragrunt-out-dir %s", testPath, tmpDir))
+	_, _, err = runTerragruntCommandWithOutput(t, fmt.Sprintf("terragrunt run-all apply --terragrunt-non-interactive --terragrunt-log-level debug --terragrunt-working-dir %s --terragrunt-out-dir %s", testPath, tmpDir))
 	require.NoError(t, err)
 }
 
@@ -7049,7 +7136,7 @@ func TestPlanJsonPlanBinaryRunAll(t *testing.T) {
 	testPath := util.JoinPath(tmpEnvPath, TEST_FIXTURE_OUT_DIR)
 
 	// run plan with output directory
-	_, _, err := runTerragruntCommandWithOutput(t, fmt.Sprintf("terraform run-all plan --terragrunt-non-interactive --terragrunt-log-level debug --terragrunt-working-dir %s --terragrunt-json-out-dir %s --terragrunt-out-dir %s", testPath, tmpDir, tmpDir))
+	_, _, err := runTerragruntCommandWithOutput(t, fmt.Sprintf("terragrunt run-all plan --terragrunt-non-interactive --terragrunt-log-level debug --terragrunt-working-dir %s --terragrunt-json-out-dir %s --terragrunt-out-dir %s", testPath, tmpDir, tmpDir))
 	require.NoError(t, err)
 
 	// verify that was generated json files with plan data
@@ -7084,21 +7171,37 @@ func TestTerragruntRunAllPlanAndShow(t *testing.T) {
 	testPath := util.JoinPath(tmpEnvPath, TEST_FIXTURE_OUT_DIR)
 
 	// run plan and apply
-	_, _, err := runTerragruntCommandWithOutput(t, fmt.Sprintf("terraform run-all plan --terragrunt-non-interactive --terragrunt-log-level debug --terragrunt-working-dir %s --terragrunt-out-dir %s", testPath, tmpDir))
+	_, _, err := runTerragruntCommandWithOutput(t, fmt.Sprintf("terragrunt run-all plan --terragrunt-non-interactive --terragrunt-log-level debug --terragrunt-working-dir %s --terragrunt-out-dir %s", testPath, tmpDir))
 	require.NoError(t, err)
 
-	_, _, err = runTerragruntCommandWithOutput(t, fmt.Sprintf("terraform run-all apply --terragrunt-non-interactive --terragrunt-log-level debug --terragrunt-working-dir %s --terragrunt-out-dir %s", testPath, tmpDir))
+	_, _, err = runTerragruntCommandWithOutput(t, fmt.Sprintf("terragrunt run-all apply --terragrunt-non-interactive --terragrunt-log-level debug --terragrunt-working-dir %s --terragrunt-out-dir %s", testPath, tmpDir))
 	require.NoError(t, err)
 
 	// run new plan and show
-	_, _, err = runTerragruntCommandWithOutput(t, fmt.Sprintf("terraform run-all plan --terragrunt-non-interactive --terragrunt-log-level debug --terragrunt-working-dir %s --terragrunt-out-dir %s", testPath, tmpDir))
+	_, _, err = runTerragruntCommandWithOutput(t, fmt.Sprintf("terragrunt run-all plan --terragrunt-non-interactive --terragrunt-log-level debug --terragrunt-working-dir %s --terragrunt-out-dir %s", testPath, tmpDir))
 	require.NoError(t, err)
 
-	stdout, _, err := runTerragruntCommandWithOutput(t, fmt.Sprintf("terraform run-all show --terragrunt-non-interactive --terragrunt-log-level debug --terragrunt-working-dir %s --terragrunt-out-dir %s -no-color", testPath, tmpDir))
+	stdout, _, err := runTerragruntCommandWithOutput(t, fmt.Sprintf("terragrunt run-all show --terragrunt-non-interactive --terragrunt-log-level debug --terragrunt-working-dir %s --terragrunt-out-dir %s -no-color", testPath, tmpDir))
 	require.NoError(t, err)
 
 	// Verify that output contains the plan and not just the actual state output
 	assert.Contains(t, stdout, "No changes. Your infrastructure matches the configuration.")
+}
+
+func TestTerragruntLogSopsErrors(t *testing.T) {
+	t.Parallel()
+
+	// create temporary directory for plan files
+	tmpEnvPath := copyEnvironment(t, TEST_FIXTURE_SOPS_ERRORS)
+	cleanupTerraformFolder(t, tmpEnvPath)
+	testPath := util.JoinPath(tmpEnvPath, TEST_FIXTURE_SOPS_ERRORS)
+
+	// apply and check for errors
+	_, errorOut, err := runTerragruntCommandWithOutput(t, fmt.Sprintf("terragrunt apply --terragrunt-non-interactive --terragrunt-log-level debug --terragrunt-working-dir %s", testPath))
+	require.Error(t, err)
+
+	require.Contains(t, errorOut, "error decrypting key: [error decrypting key")
+	require.Contains(t, errorOut, "error base64-decoding encrypted data key: illegal base64 data at input byte")
 }
 
 func validateOutput(t *testing.T, outputs map[string]TerraformOutput, key string, value interface{}) {

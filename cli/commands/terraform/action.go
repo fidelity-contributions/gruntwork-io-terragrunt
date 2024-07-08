@@ -12,6 +12,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gruntwork-io/terragrunt/cli/commands/terraform/creds"
+	"github.com/gruntwork-io/terragrunt/cli/commands/terraform/creds/providers/amazonsts"
+	"github.com/gruntwork-io/terragrunt/cli/commands/terraform/creds/providers/externalcmd"
 	"github.com/gruntwork-io/terragrunt/telemetry"
 
 	"github.com/gruntwork-io/terragrunt/terraform"
@@ -21,7 +24,6 @@ import (
 	"github.com/mattn/go-zglob"
 
 	"github.com/gruntwork-io/go-commons/errors"
-	"github.com/gruntwork-io/terragrunt/aws_helper"
 	"github.com/gruntwork-io/terragrunt/codegen"
 	"github.com/gruntwork-io/terragrunt/config"
 	"github.com/gruntwork-io/terragrunt/configstack"
@@ -88,6 +90,11 @@ func runTerraform(ctx context.Context, terragruntOptions *options.TerragruntOpti
 		return target.runErrorCallback(terragruntOptions, nil, err)
 	}
 
+	credsGetter := creds.NewGetter()
+	if err := credsGetter.ObtainAndUpdateEnvIfNecessary(ctx, terragruntOptions, externalcmd.NewProvider(terragruntOptions)); err != nil {
+		return err
+	}
+
 	terragruntConfig, err := config.ReadTerragruntConfig(terragruntOptions)
 	if err != nil {
 		return target.runErrorCallback(terragruntOptions, terragruntConfig, err)
@@ -119,7 +126,7 @@ func runTerraform(ctx context.Context, terragruntOptions *options.TerragruntOpti
 		terragruntOptions.OriginalIAMRoleOptions,
 	)
 
-	if err := aws_helper.AssumeRoleAndUpdateEnvIfNecessary(terragruntOptions); err != nil {
+	if err := credsGetter.ObtainAndUpdateEnvIfNecessary(ctx, terragruntOptions, amazonsts.NewProvider(terragruntOptions)); err != nil {
 		return err
 	}
 
@@ -405,13 +412,13 @@ func runTerraformWithRetry(ctx context.Context, terragruntOptions *options.Terra
 	for i := 0; i < terragruntOptions.RetryMaxAttempts; i++ {
 		if out, err := shell.RunTerraformCommandWithOutput(ctx, terragruntOptions, terragruntOptions.TerraformCliArgs...); err != nil {
 			if out == nil || !isRetryable(terragruntOptions, out) {
-				terragruntOptions.Logger.Errorf("%s invocation failed in %s", terragruntOptions.TerraformImplementation, terragruntOptions.WorkingDir)
+				terragruntOptions.Logger.WithError(err).Errorf("%s invocation failed in %s", terragruntOptions.TerraformImplementation, terragruntOptions.WorkingDir)
 				return err
 			} else {
 				terragruntOptions.Logger.Infof("Encountered an error eligible for retrying. Sleeping %v before retrying.\n", terragruntOptions.RetrySleepIntervalSec)
 				select {
 				case <-ctx.Done():
-					return ctx.Err()
+					return errors.WithStackTrace(ctx.Err())
 				case <-time.After(terragruntOptions.RetrySleepIntervalSec):
 					// try again
 				}
@@ -613,14 +620,14 @@ func prepareInitOptions(terragruntOptions *options.TerragruntOptions) *options.T
 // modules at all. Detecting if your downloaded modules are out of date (as opposed to missing entirely) is more
 // complicated and not something we handle at the moment.
 func modulesNeedInit(terragruntOptions *options.TerragruntOptions) (bool, error) {
-	moduleNeedInit := util.JoinPath(terragruntOptions.WorkingDir, moduleInitRequiredFile)
-	if util.FileExists(moduleNeedInit) {
-		return true, nil
-	}
-
 	modulesPath := util.JoinPath(terragruntOptions.DataDir(), "modules")
 	if util.FileExists(modulesPath) {
 		return false, nil
+	}
+
+	moduleNeedInit := util.JoinPath(terragruntOptions.WorkingDir, moduleInitRequiredFile)
+	if util.FileExists(moduleNeedInit) {
+		return true, nil
 	}
 
 	return util.Grep(ModuleRegex, fmt.Sprintf("%s/%s", terragruntOptions.WorkingDir, TerraformExtensionGlob))

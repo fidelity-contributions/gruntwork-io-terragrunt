@@ -75,7 +75,6 @@ This page documents the CLI commands and options available with Terragrunt:
   - [terragrunt-tf-logs-to-json](#terragrunt-tf-logs-to-json)
   - [terragrunt-provider-cache](#terragrunt-provider-cache)
   - [terragrunt-provider-cache-dir](#terragrunt-provider-cache-dir)
-  - [terragrunt-provider-cache-disable-partial-lock-file](#terragrunt-provider-cache-disable-partial-lock-file)
   - [terragrunt-provider-cache-hostname](#terragrunt-provider-cache-hostname)
   - [terragrunt-provider-cache-port](#terragrunt-provider-cache-port)
   - [terragrunt-provider-cache-token](#terragrunt-provider-cache-token)
@@ -743,7 +742,6 @@ prefix `--terragrunt-` (e.g., `--terragrunt-config`). The currently available op
   - [terragrunt-tf-logs-to-json](#terragrunt-tf-logs-to-json)
   - [terragrunt-provider-cache](#terragrunt-provider-cache)
   - [terragrunt-provider-cache-dir](#terragrunt-provider-cache-dir)
-  - [terragrunt-provider-cache-disable-partial-lock-file](#terragrunt-provider-cache-disable-partial-lock-file)
   - [terragrunt-provider-cache-hostname](#terragrunt-provider-cache-hostname)
   - [terragrunt-provider-cache-port](#terragrunt-provider-cache-port)
   - [terragrunt-provider-cache-token](#terragrunt-provider-cache-token)
@@ -770,7 +768,7 @@ explanation). This argument is not used with the `run-all` commands.
 **Environment Variable**: `TERRAGRUNT_TFPATH`<br/>
 **Requires an argument**: `--terragrunt-tfpath /path/to/terraform-binary`<br/>
 
-A custom path to the Terraform binary. The default is `terraform` in a directory on your PATH.
+A custom path to the Terraform binary. The default is `tofu` in a directory on your PATH.
 
 **NOTE**: This will override the `terraform` binary that is used by `terragrunt` in all instances, including
 `dependency` lookups. This setting will also override any [terraform_binary]({{site.baseurl}}/docs/reference/config-blocks-and-attributes/#terraform_binary)
@@ -816,7 +814,7 @@ When passed in, don't automatically retry commands which fail with transient err
 **Environment Variable**: `TERRAGRUNT_NON_INTERACTIVE` (set to `true`)<br/>
 _(Prior to Terragrunt v0.48.6, this environment variable was called `TF_INPUT` (set to `false`), and is still available for backwards compatibility. NOTE: [TF_INPUT](https://developer.hashicorp.com/terraform/cli/config/environment-variables#tf_input) is native to Terraform!)_
 
-When passed in, don't show interactive user prompts. This will default the answer for all prompts to `yes` except for
+When passed in, don't show interactive user prompts. This will default the answer for all Terragrunt (not OpenTofu/Terraform) prompts to `yes` except for
 the listed cases below. This is useful if you need to run Terragrunt in an automated setting (e.g. from a script). May
 also be specified with the [TF_INPUT](https://www.terraform.io/docs/configuration/environment-variables.html#tf_input) environment variable.
 
@@ -824,6 +822,16 @@ This setting will default to `no` for the following cases:
 
 - Prompts related to pulling in external dependencies. You can force include external dependencies using the
   [--terragrunt-include-external-dependencies](#terragrunt-include-external-dependencies) option.
+
+Note that this does not impact the behavior of OpenTofu/Terraform commands invoked by Terragrunt.
+
+e.g.
+
+```bash
+terragrunt --terragrunt-non-interactive apply -auto-approve
+```
+
+Is how you would make Terragrunt apply without any user prompts from Terragrunt or OpenTofu/Terraform.
 
 ### terragrunt-working-dir
 
@@ -1175,6 +1183,18 @@ Currently only AWS S3 backend is supported.
 This flag can be used to drastically decrease time required for parsing Terragrunt files. The effect will only show if a lot of similar includes are expected such as the root terragrunt.hcl include.
 NOTE: This is an experimental feature, use with caution.
 
+The reason you might want to use this flag is that Terragrunt frequently only needs to perform a partial parse of Terragrunt configurations.
+
+This is the case for scenarios like:
+
+- Building the Directed Acyclic Graph (DAG) during a `run-all` command where only the `dependency` blocks need to be evaluated to determine run order.
+- Parsing the `terraform` block to determine state configurations for fetching `dependency` outputs.
+- Determining whether Terragrunt execution behavior has to change like for `prevent_destroy` or `skip` flags in configuration.
+
+These configurations are generally safe to cache, but due to the nature of HCL being a dynamic configuration language, there are some edge cases where caching these can lead to incorrect behavior.
+
+Once this flag has been tested thoroughly, we will consider making it the default behavior.
+
 ### terragrunt-include-module-prefix
 
 **CLI Arg**: `--terragrunt-include-module-prefix`<br/>
@@ -1237,16 +1257,6 @@ Enables Terragrunt's provider caching. This forces Terraform to make provider re
 
 The path to the Terragrunt provider cache directory. By default, `terragrunt/providers` folder in the user cache directory: `$HOME/.cache` on Unix systems, `$HOME/Library/Caches` on Darwin, `%LocalAppData%` on Windows. The file structure of the cache directory is identical to the Terraform [plugin_cache_dir](https://developer.hashicorp.com/terraform/cli/config/config-file#provider-plugin-cache) directory. Make sure to read [Provider Caching](https://terragrunt.gruntwork.io/docs/features/provider-caching/) for context.
 
-### terragrunt-provider-cache-disable-partial-lock-file
-
-**CLI Arg**: `--terragrunt-provider-cache-disable-partial-lock-file`<br/>
-**Environment Variable**: `TERRAGRUNT_PROVIDER_CACHE_DISABLE_PARTIAL_LOCK_FILE`<br/>
-**Commands**:
-
-- [run-all](#run-all)
-
-By default, Terraform does _not_ use the cache for modules without a lock file. This results in lots of extra provider downloading. To work around this, for modules without a lock file, Terragurnt provider caching enables the [_plugin_cache_may_break_dependency_lock_file_](https://developer.hashicorp.com/terraform/cli/config/config-file#provider-installation) feature, which allows Terraform to generate a partial lock file if it finds the providers it needs in the cache. This avoids lots of unnecessary provider downloads, but results in partial lock files. If you wish to disable this feature, set this flag flag, and Terragrunt will run `terraform providers lock` before `init` for modules without lock files, which will generate a complete lock file, but at the cost of more provider downloads. Make sure to read [Provider Caching](https://terragrunt.gruntwork.io/docs/features/provider-caching/) for context.
-
 ### terragrunt-provider-cache-hostname
 
 **CLI Arg**: `--terragrunt-provider-cache-hostname`<br/>
@@ -1306,3 +1316,46 @@ Specify the plan output directory for the `*-all` commands. Useful to save plans
 - [run-all](#run-all)
 
 Specify the output directory for the `*-all` commands to store plans in JSON format. Useful to read plans programmatically.
+
+### terragrunt-auth-provider-cmd
+
+**CLI Arg**: `--terragrunt-auth-provider-cmd`<br/>
+**Environment Variable**: `TERRAGRUNT_AUTH_PROVIDER_CMD`<br/>
+**Requires an argument**: `--terragrunt-auth-provider-cmd "command [arguments]"`<br/>
+
+The command and arguments used to obtain authentication credentials dynamically. If specified, Terragrunt runs this command for every working directory before running the underlying IAC for a `terragrunt.hcl` file.
+
+The output must be valid JSON of the following schema:
+
+```json
+{
+  "awsCredentials": {
+    "ACCESS_KEY_ID": "",
+    "SECRET_ACCESS_KEY": "",
+    "SESSION_TOKEN": ""
+  },
+  "envs": {
+    "ANY_KEY": ""
+  }
+}
+```
+
+This allows Terragrunt to acquire different credentials at runtime without changing any `terragrunt.hcl` configuration. You can use this flag to set arbitrary credentials for continuous integration, authentication with providers other than AWS and more.
+
+As long as the standard output of the command passed to `terragrunt-auth-provider-cmd` results in JSON matching the schema above, corresponding environment variables will be set before Terragrunt begins IAC execution for a `terragrunt.hcl` file.
+
+The simplest approach to leverage this flag is to write a script that fetches desired credentials, and emits them to STDOUT in the JSON format listed above:
+
+```bash
+#!/usr/bin/env bash
+
+echo -n '{"envs": {"KEY": "a secret"}}'
+```
+
+You can use any technology you'd like, however, as long as Terragrunt can execute it. The expected pattern for using this flag is to populate the values dynamically using a secret store, etc.
+
+Note that more specific configurations (e.g. `awsCredentials`) take precedence over less specific configurations (e.g. `envs`).
+
+If you would like to set credentials for AWS with this method, you are encouraged to use `awsCredentials` instead of `envs`, as these keys will be validated to conform to the officially supported environment variables expected by the AWS SDK.
+
+Other credential configurations will be supported in the future, but until then, if your provider authenticates via environment variables, you can use the `envs` field to fetch credentials dynamically from a secret store, etc before Terragrunt executes any IAC.
